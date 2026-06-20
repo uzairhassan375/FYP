@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "/Users/macbook/Documents/Projects/FYP/Code/webApp/ai/datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "06cc9b11431648658f1207520213d0e63e1b3809e2fab5772d82f78433eb54e9",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

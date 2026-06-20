@@ -1,0 +1,95 @@
+# =========================
+# Node / Frontend / Backend
+# =========================
+node_modules/
+dist/
+build/
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+coverage/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json.bak
+
+# =========================
+# Python / AI
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+ai/venv/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Backend runtime folders (generated)
+backend/uploads/
+backend/frames/
+ai/uploads/
+ai/static/uploads/
+
+# =========================
+# Environment variables (secrets)
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# AI models & large data
+# =========================
+*.h5
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.safetensors
+models/
+weights/
+checkpoints/
+
+# Datasets & outputs
+datasets/
+new dataset/
+results/
+test/
+frames/
+output/
+outputs/
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# =========================
+# Archives / documents
+# =========================
+*.zip
+*.rar
+*.7z
+*.pdf
+*.docx
+*.pptx
+*.xlsx

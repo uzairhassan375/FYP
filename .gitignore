@@ -1,0 +1,27 @@
+# =========================
+# Monorepo root (HawkEye)
+# =========================
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Environment (secrets — never commit)
+.env
+.env.*
+!.env.example
+
+# Archives
+*.zip
+*.rar
+*.7z

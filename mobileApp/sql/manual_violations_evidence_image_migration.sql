@@ -1,0 +1,3 @@
+-- Deprecated: image + video evidence upgrades are included at the bottom of
+-- `manual_violations_and_storage.sql`. Run that file (or only the upgrade block there)
+-- on your Supabase project.
