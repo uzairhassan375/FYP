@@ -1235,70 +1235,74 @@ class DetectorPipeline:
                     except Exception:
                         cached_dresscode = []
 
-                # Annotate
+                # Count detections only when each model runs — cached results persist
+                # between strides and must not be counted again on every output frame.
+                if frame_idx % self.object_stride == 0:
+                    for _x1, _y1, _x2, _y2, label, _conf in cached_boxes:
+                        key = str(label).lower()
+                        weapon_counts[key] = weapon_counts.get(key, 0) + 1
+
+                if frame_idx % self.face_stride == 0:
+                    for _x1, _y1, _x2, _y2, name, _conf_face, _sid in cached_faces:
+                        face_counts[str(name)] = face_counts.get(str(name), 0) + 1
+
+                if frame_idx % self.fight_stride == 0:
+                    is_fight, fight_conf = fight_cache
+                    if is_fight:
+                        fight_frames += 1
+                        fight_max_conf = max(fight_max_conf, float(fight_conf))
+
+                if frame_idx % self.dresscode_stride == 0:
+                    for _x1, _y1, _x2, _y2, label, _conf in cached_dresscode:
+                        if str(label).lower() != "allowed":
+                            key = str(label).lower()
+                            dresscode_counts[key] = dresscode_counts.get(key, 0) + 1
+
+                # Draw detection boxes only (no alert banners or progress overlay)
                 annotated = frame.copy()
                 for x1, y1, x2, y2, label, conf in cached_boxes:
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 0), 2)
                     if self.show_labels:
-                        cv2.putText(annotated, f"{label} {conf:.2f}", (x1, max(16, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2, cv2.LINE_AA)
+                        cv2.putText(
+                            annotated,
+                            f"{label} {conf:.2f}",
+                            (x1, max(16, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 200, 0),
+                            2,
+                            cv2.LINE_AA,
+                        )
 
                 for x1, y1, x2, y2, name, conf_face, _sid in cached_faces:
                     color = (0, 255, 255) if name == "Unknown" else (255, 180, 0)
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(annotated, f"{name} {conf_face:.2f}", (x1, max(16, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+                    cv2.putText(
+                        annotated,
+                        f"{name} {conf_face:.2f}",
+                        (x1, max(16, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
 
-                violation_count = 0
-                violation_labels = set()
                 for x1, y1, x2, y2, label, conf in cached_dresscode:
-                    is_violation = label.lower() != "allowed"
+                    is_violation = str(label).lower() != "allowed"
                     color = (255, 0, 255) if is_violation else (0, 200, 0)
-                    if is_violation:
-                        violation_count += 1
-                        violation_labels.add(label)
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                     if self.show_labels:
-                        cv2.putText(annotated, f"DC: {label} {conf:.2f}", (x1, max(16, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
-
-                is_fight, fight_conf = fight_cache
-                for _x1, _y1, _x2, _y2, label, _conf in cached_boxes:
-                    key = str(label).lower()
-                    weapon_counts[key] = weapon_counts.get(key, 0) + 1
-                for _x1, _y1, _x2, _y2, name, _conf_face, _sid in cached_faces:
-                    face_counts[str(name)] = face_counts.get(str(name), 0) + 1
-                if is_fight:
-                    fight_frames += 1
-                    fight_max_conf = max(fight_max_conf, float(fight_conf))
-                for _x1, _y1, _x2, _y2, label, _conf in cached_dresscode:
-                    if str(label).lower() != "allowed":
-                        key = str(label).lower()
-                        dresscode_counts[key] = dresscode_counts.get(key, 0) + 1
-
-                h, w = annotated.shape[:2]
-                banner_y = h
-                banner_h = 36
-
-                if violation_count > 0:
-                    banner_y -= banner_h
-                    cv2.rectangle(annotated, (0, banner_y), (w, banner_y + banner_h), (180, 0, 180), -1)
-                    cv2.putText(annotated, f"DRESS CODE VIOLATION: {', '.join(sorted(violation_labels))}", (10, banner_y + banner_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-
-                if is_fight:
-                    banner_y -= banner_h
-                    cv2.rectangle(annotated, (0, banner_y), (w, banner_y + banner_h), (0, 0, 180), -1)
-                    cv2.putText(annotated, f"FIGHT DETECTED ({fight_conf:.2f})", (10, banner_y + banner_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-
-                # Draw progress
-                percent = int((frame_idx / total_frames) * 100) if total_frames > 0 else 0
-                elapsed = time.time() - self.stats.start_time
-                fps = frame_idx / elapsed if elapsed > 0 else 0
-                eta = int((total_frames - frame_idx) / fps) if fps > 0 else 0
-
-                progress_text = f"{percent}% | ETA: {eta}s"
-                cv2.putText(annotated, progress_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA)
-
-                # Progress bar
-                bar_width = int((frame_idx / total_frames) * w) if total_frames > 0 else 0
-                cv2.rectangle(annotated, (0, h - 10), (bar_width, h), (0, 255, 0), -1)
+                        cv2.putText(
+                            annotated,
+                            f"DC: {label} {conf:.2f}",
+                            (x1, max(16, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            2,
+                            cv2.LINE_AA,
+                        )
 
                 out.write(annotated)
                 written_frames += 1

@@ -118,38 +118,10 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
             dresscodeTotal: data.offline_dresscode_total || 0,
             processedFrames: data.processed_frames || 0,
         });
-
-        if (data.offline_weapon_summary) {
-            const weapons = String(data.offline_weapon_summary)
-                .split(", ")
-                .filter(Boolean)
-                .map((entry) => {
-                    const match = entry.match(/^(.+)\s+\((\d+)\)$/);
-                    return { weapon: match ? match[1] : entry, personLabel: null };
-                });
-            setWeaponDetections(weapons.slice(0, 8));
-        } else {
-            setWeaponDetections([]);
-        }
-
-        if (data.offline_fight_detected) {
-            setFightDetection({ detected: true, confidence: data.offline_fight_max_conf || 0 });
-        } else {
-            setFightDetection(null);
-        }
-
-        if (data.offline_dresscode_summary) {
-            const dress = String(data.offline_dresscode_summary)
-                .split(", ")
-                .filter(Boolean)
-                .map((entry) => {
-                    const match = entry.match(/^(.+)\s+\((\d+)\)$/);
-                    return { type: match ? match[1] : entry };
-                });
-            setDresscodeViolations(dress);
-        } else {
-            setDresscodeViolations([]);
-        }
+        // Keep overlay badges off offline playback — results live in the sidebar only.
+        setWeaponDetections([]);
+        setFightDetection(null);
+        setDresscodeViolations([]);
     };
 
     const buildOfflineVideoUrl = (outputPath) => {
@@ -883,7 +855,7 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                                 <>
                                     <CheckCircle className="text-emerald-400" size={48} />
                                     <p className="font-bold text-white">Analysis complete</p>
-                                    <p className="text-xs text-slate-400 text-center">Annotated video should appear here when ready</p>
+                                    <p className="text-xs text-slate-400 text-center">Processed video will appear here when ready</p>
                                 </>
                             ) : (
                                 <>
@@ -935,8 +907,8 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                     </span>
                 </div>
 
-                {/* Fight alert banner */}
-                {fightDetection?.detected && (
+                {/* Violation overlays — live modes only (not offline processed video) */}
+                {sourceType !== 'offline' && fightDetection?.detected && (
                     <div className="absolute top-20 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-orange-600/95 backdrop-blur-md px-4 py-2 rounded-xl border-2 border-orange-400 z-20 shadow-lg">
                         <ShieldAlert className="text-white" size={20} />
                         <span className="text-sm font-bold text-white">
@@ -945,8 +917,7 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                     </div>
                 )}
 
-                {/* Dresscode alert banner */}
-                {dresscodeViolations.length > 0 && (
+                {sourceType !== 'offline' && dresscodeViolations.length > 0 && (
                     <div className="absolute top-32 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-purple-600/95 backdrop-blur-md px-4 py-2 rounded-xl border-2 border-purple-400 z-20 shadow-lg">
                         <ShieldAlert className="text-white" size={20} />
                         <span className="text-sm font-bold text-white">
@@ -955,8 +926,7 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                     </div>
                 )}
 
-                {/* Weapon alert banner */}
-                {weaponDetections.length > 0 && (
+                {sourceType !== 'offline' && weaponDetections.length > 0 && (
                     <div className="absolute top-6 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-red-600/95 backdrop-blur-md px-4 py-2 rounded-xl border-2 border-red-400 z-20 shadow-lg">
                         <ShieldAlert className="text-white" size={20} />
                         <span className="text-sm font-bold text-white">
@@ -980,20 +950,20 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                 )}
             </div>
 
-            {/* Control Panel */}
-            <div className="w-full md:w-80 p-8 flex flex-col justify-between bg-slate-900 border-l border-white/10">
-                <div className="space-y-8">
-                    <div className="flex justify-between items-start">
-                        <div>
-                            <h2 className="text-2xl font-black text-white italic tracking-tighter">Hawk<span className="text-blue-500">Eye</span></h2>
-                            <p className="text-slate-400 text-sm font-semibold mt-1">Real-time Recognition</p>
-                        </div>
-                        <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-xl transition-colors text-slate-400">
-                            <X size={20} />
-                        </button>
+            {/* Control Panel — scrollable sidebar */}
+            <div className="w-full md:w-80 flex flex-col min-h-0 max-h-[70vh] md:max-h-none md:h-full bg-slate-900 border-l border-white/10">
+                <div className="shrink-0 px-8 pt-8 pb-4 flex justify-between items-start">
+                    <div>
+                        <h2 className="text-2xl font-black text-white italic tracking-tighter">Hawk<span className="text-blue-500">Eye</span></h2>
+                        <p className="text-slate-400 text-sm font-semibold mt-1">Real-time Recognition</p>
                     </div>
+                    <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-xl transition-colors text-slate-400">
+                        <X size={20} />
+                    </button>
+                </div>
 
-                    <div className="space-y-4">
+                <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-8 pb-4">
+                <div className="space-y-8">
                         {/* Source Switcher */}
                         <div className="flex flex-wrap bg-slate-800 p-1 rounded-xl gap-1">
                             {[
@@ -1163,10 +1133,10 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                                         </p>
                                         <div className="space-y-1.5 text-xs text-slate-300">
                                             <p><span className="text-slate-500">Frames:</span> {offlineResults.processedFrames}</p>
-                                            <p><span className="text-slate-500">Weapons:</span> {offlineResults.weaponTotal > 0 ? offlineResults.weapons : "None detected"}</p>
-                                            <p><span className="text-slate-500">Faces:</span> {offlineResults.faceTotal > 0 ? offlineResults.faces : "None detected"}</p>
-                                            <p><span className="text-slate-500">Fight:</span> {offlineResults.fight ? `Yes (${Math.round(offlineResults.fightConf * 100)}% max, ${offlineResults.fightFrames} frames)` : "None detected"}</p>
-                                            <p><span className="text-slate-500">Dress code:</span> {offlineResults.dresscodeTotal > 0 ? offlineResults.dresscode : "None detected"}</p>
+                                            <p><span className="text-slate-500">Weapons:</span> {offlineResults.weaponTotal > 0 ? `${offlineResults.weapons} (analyzed frames)` : "None detected"}</p>
+                                            <p><span className="text-slate-500">Faces:</span> {offlineResults.faceTotal > 0 ? `${offlineResults.faces} (analyzed frames)` : "None detected"}</p>
+                                            <p><span className="text-slate-500">Fight:</span> {offlineResults.fight ? `Yes (${Math.round(offlineResults.fightConf * 100)}% max, ${offlineResults.fightFrames} analyzed frames)` : "None detected"}</p>
+                                            <p><span className="text-slate-500">Dress code:</span> {offlineResults.dresscodeTotal > 0 ? `${offlineResults.dresscode} (analyzed frames)` : "None detected"}</p>
                                         </div>
                                     </div>
                                 )}
@@ -1180,7 +1150,7 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                                         rel="noreferrer"
                                         className="text-[10px] text-blue-400 underline block"
                                     >
-                                        Open annotated video in new tab
+                                        Open processed video in new tab
                                     </a>
                                 )}
                             </div>
@@ -1269,7 +1239,7 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                     )}
                 </div>
 
-                <div className="space-y-4 mt-8">
+                <div className="shrink-0 px-8 pb-8 pt-4 border-t border-white/5 space-y-4">
                     {sourceType !== 'pipeline' && sourceType !== 'offline' && (
                         !isSyncing ? (
                             <button
