@@ -102,7 +102,6 @@ class _RewardsScreenState extends State<RewardsScreen> with WidgetsBindingObserv
     var sum = 0;
     for (final r in _rows) {
       final p = r['points'];
-      if (p is int) sum += p;
       if (p is num) sum += p.toInt();
     }
     return sum;

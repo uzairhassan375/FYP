@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import Topbar from "../../components/Topbar";
 import StudentsFilters from "../../components/StudentsFilters";
 import StudentsGrid from "../../components/StudentsGrid";
@@ -15,6 +15,8 @@ export default function Students() {
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [search, setSearch] = useState("");
+  const [departmentFilter, setDepartmentFilter] = useState("all");
 
   const fetchStudents = useCallback(async () => {
     setLoading(true);
@@ -32,6 +34,34 @@ export default function Students() {
   useEffect(() => {
     fetchStudents();
   }, [fetchStudents]);
+
+  const departments = useMemo(() => {
+    const set = new Set();
+    for (const s of students) {
+      const dept = String(s.department || "").trim();
+      if (dept) set.add(dept);
+    }
+    return Array.from(set).sort();
+  }, [students]);
+
+  const filteredStudents = useMemo(() => {
+    return students.filter((s) => {
+      const name = String(s.name || "").toLowerCase();
+      const roll = String(s.rollNumber || s.roll_number || "").toLowerCase();
+      const email = String(s.email || "").toLowerCase();
+      const dept = String(s.department || "").trim().toLowerCase();
+
+      const matchesSearch =
+        name.includes(search.toLowerCase()) ||
+        roll.includes(search.toLowerCase()) ||
+        email.includes(search.toLowerCase());
+
+      const matchesDept =
+        departmentFilter === "all" || dept === departmentFilter.toLowerCase();
+
+      return matchesSearch && matchesDept;
+    });
+  }, [students, search, departmentFilter]);
 
   const handleDeleteStudent = useCallback(async (student) => {
     const id = student._id || student.id;
@@ -78,9 +108,15 @@ export default function Students() {
           </button>
         </div>
 
-        <StudentsFilters />
+        <StudentsFilters
+          search={search}
+          setSearch={setSearch}
+          departmentFilter={departmentFilter}
+          setDepartmentFilter={setDepartmentFilter}
+          departments={departments}
+        />
         <StudentsGrid
-          students={students}
+          students={filteredStudents}
           loading={loading}
           error={error}
           onViewDetails={setViewStudent}

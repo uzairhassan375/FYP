@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { Bell, FileText, Receipt, CheckCircle, Loader2, AlertCircle, RefreshCw } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { Card, CardContent } from "../../components/Card";
 import { apiGet, apiPatch } from "../../lib/api";
 
@@ -12,10 +13,13 @@ function statusColor(status) {
 }
 
 export default function PenaltiesChallans() {
+  const navigate = useNavigate();
   const [fines, setFines] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [updating, setUpdating] = useState(null);
+  const [typeFilter, setTypeFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
 
   const fetchFines = useCallback(async () => {
     try {
@@ -65,10 +69,32 @@ export default function PenaltiesChallans() {
 
   // Computed summary
   const totalFines = fines.length;
-  const totalAmount = fines.reduce((sum, f) => sum + (f.amount || 0), 0);
   const pendingFines = fines.filter((f) => f.status === "Pending");
   const paidFines = fines.filter((f) => f.status === "Paid");
   const pendingAmount = pendingFines.reduce((sum, f) => sum + (f.amount || 0), 0);
+
+  const violationTypes = useMemo(() => {
+    const set = new Set();
+    for (const f of fines) {
+      const type = f.violationType || f.violation_type;
+      const t = type ? String(type).trim().toLowerCase() : "";
+      if (t) set.add(t);
+    }
+    return Array.from(set).sort();
+  }, [fines]);
+
+  const filteredFines = useMemo(() => {
+    return fines.filter((f) => {
+      const type = f.violationType || f.violation_type;
+      const t = type ? String(type).trim().toLowerCase() : "";
+      const s = String(f.status || "").trim();
+
+      const matchType = typeFilter === "all" || t === typeFilter;
+      const matchStatus = statusFilter === "all" || s === statusFilter;
+
+      return matchType && matchStatus;
+    });
+  }, [fines, typeFilter, statusFilter]);
 
   const summaryCards = [
     { title: "Total Fines", value: totalFines, icon: Receipt, color: "text-blue-600" },
@@ -93,7 +119,13 @@ export default function PenaltiesChallans() {
           >
             <RefreshCw className="w-5 h-5" />
           </button>
-          <Bell className="w-6 h-6 text-slate-500" />
+          <button
+            onClick={() => navigate("/incharge/notifications")}
+            className="p-2 rounded-lg hover:bg-slate-100 text-slate-500 transition-colors"
+            title="Notifications"
+          >
+            <Bell className="w-6 h-6" />
+          </button>
           <div className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center font-medium">
             S
           </div>
@@ -124,9 +156,49 @@ export default function PenaltiesChallans() {
         {/* Fines Table */}
         <Card>
           <CardContent>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold">Fines List</h2>
-              {loading && <Loader2 className="w-5 h-5 text-blue-600 animate-spin" />}
+            {/* Filter Bar */}
+            <div className="flex flex-col gap-4 md:flex-row md:items-center justify-between mb-6 pb-4 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-semibold">Fines List</h2>
+                {loading && <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />}
+                {!loading && (
+                  <span className="text-xs text-slate-400">
+                    Showing {filteredFines.length} of {fines.length}
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-4">
+                <div className="flex items-center gap-2 text-sm">
+                  <span className="text-slate-500 font-medium">Violation Type:</span>
+                  <select
+                    value={typeFilter}
+                    onChange={(e) => setTypeFilter(e.target.value)}
+                    className="border border-slate-200 rounded-lg px-3 py-1.5 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 capitalize"
+                  >
+                    <option value="all">All Types</option>
+                    {violationTypes.map((t) => (
+                      <option key={t} value={t}>
+                        {t.replace(/_/g, " ")}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex items-center gap-2 text-sm">
+                  <span className="text-slate-500 font-medium">Status:</span>
+                  <select
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value)}
+                    className="border border-slate-200 rounded-lg px-3 py-1.5 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="Pending">Pending</option>
+                    <option value="Paid">Paid</option>
+                    <option value="Waived">Waived</option>
+                  </select>
+                </div>
+              </div>
             </div>
 
             {loading && fines.length === 0 ? (
@@ -137,6 +209,11 @@ export default function PenaltiesChallans() {
               <div className="text-center py-12 text-slate-400">
                 <Receipt className="w-12 h-12 mx-auto mb-3 opacity-30" />
                 <p>No fines issued yet. Fines are applied automatically when a student violates a policy rule.</p>
+              </div>
+            ) : filteredFines.length === 0 ? (
+              <div className="text-center py-12 text-slate-400">
+                <Receipt className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                <p>No fines match the selected filters.</p>
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -153,7 +230,7 @@ export default function PenaltiesChallans() {
                     </tr>
                   </thead>
                   <tbody className="divide-y">
-                    {fines.map((fine) => {
+                    {filteredFines.map((fine) => {
                       const fineId = fine._id || fine.id;
                       const isUpdating = updating === fineId;
                       return (
@@ -162,7 +239,9 @@ export default function PenaltiesChallans() {
                             {String(fineId).slice(0, 8)}…
                           </td>
                           <td className="font-medium p-2">{fine.studentName || "Unknown"}</td>
-                          <td className="p-2 capitalize">{fine.violationType || fine.violation_type || "—"}</td>
+                          <td className="p-2 capitalize">
+                            {(fine.violationType || fine.violation_type || "—").replace(/_/g, " ")}
+                          </td>
                           <td className="p-2 font-bold text-blue-700">Rs. {(fine.amount || 0).toLocaleString()}</td>
                           <td className="text-slate-500 p-2">{fine.time || "—"}</td>
                           <td className="p-2">

@@ -52,6 +52,7 @@ function toClientViolation(row) {
     studentId: row.student_id,
     student: row.student_name,
     studentName: row.student_name,
+    studentRollNumber: (Array.isArray(row.students) ? row.students[0]?.roll_number : row.students?.roll_number) || null,
     camera: row.camera_name,
     cameraId: row.camera_id,
     cameraName: row.camera_name,
@@ -99,6 +100,22 @@ function toClientFine(row) {
     violationType: row.violation_type,
     policyRuleId: row.policy_rule_id,
     time: row.created_at ? new Date(row.created_at).toLocaleString() : null,
+  };
+}
+function toClientFineAppeal(row, fineRow) {
+  if (!row) return null;
+  return {
+    ...row,
+    _id: row.id,
+    fineId: row.fine_id,
+    studentId: row.student_id,
+    studentUserId: row.student_user_id,
+    studentName: row.student_name,
+    reviewNote: row.review_note,
+    reviewedByName: row.reviewed_by_name,
+    reviewedAt: row.reviewed_at,
+    time: row.created_at ? new Date(row.created_at).toLocaleString() : null,
+    fine: fineRow ? toClientFine(fineRow) : null,
   };
 }
 
@@ -339,6 +356,7 @@ async function findRecentCameraViolation(studentId, violationType, { status } = 
 /**
  * Create a live-camera violation + optional fine unless the same student/type
  * was already recorded in the last 15 minutes (detection still shown in UI).
+ * Pass skipCooldown: true when processing multiple findings from one video file.
  */
 async function createLiveCameraViolationIfEligible({
   studentId = null,
@@ -350,28 +368,33 @@ async function createLiveCameraViolationIfEligible({
   location = "Camera Feed",
   notifyReview = false,
   reviewTitle = null,
+  skipCooldown = false,
+  manualViolationId = null,
 }) {
   const vt = String(violationType).toLowerCase().trim();
-  const recent = await findRecentCameraViolation(
-    studentId,
-    vt,
-    status === "PendingReview" ? { status: "PendingReview" } : {},
-  );
 
-  if (recent) {
-    const cooldownUntil = new Date(
-      new Date(recent.created_at).getTime() + VIOLATION_COOLDOWN_MS,
-    ).toISOString();
-    console.log(
-      `[Violation] Cooldown active for ${studentName || "Unknown"} (${vt}) — detection only`,
+  if (!skipCooldown) {
+    const recent = await findRecentCameraViolation(
+      studentId,
+      vt,
+      status === "PendingReview" ? { status: "PendingReview" } : {},
     );
-    return {
-      created: false,
-      reason: "cooldown_active",
-      violationId: recent.id,
-      cooldownUntil,
-      fineResult: { applied: false, reason: "cooldown_active", cooldownUntil },
-    };
+
+    if (recent) {
+      const cooldownUntil = new Date(
+        new Date(recent.created_at).getTime() + VIOLATION_COOLDOWN_MS,
+      ).toISOString();
+      console.log(
+        `[Violation] Cooldown active for ${studentName || "Unknown"} (${vt}) — detection only`,
+      );
+      return {
+        created: false,
+        reason: "cooldown_active",
+        violationId: recent.id,
+        cooldownUntil,
+        fineResult: { applied: false, reason: "cooldown_active", cooldownUntil },
+      };
+    }
   }
 
   const { data: violationRow, error } = await supabase
@@ -408,6 +431,7 @@ async function createLiveCameraViolationIfEligible({
       studentName,
       vt,
       violationRow.id,
+      { skipCooldown, manualViolationId },
     );
   }
 
@@ -418,12 +442,67 @@ async function createLiveCameraViolationIfEligible({
   };
 }
 
+/** Same HTTP request may detect multiple violations; allow each after the first. */
+async function createLiveCameraViolationForBatch(batchKeys, params) {
+  const vt = String(params.violationType || "").toLowerCase().trim();
+  const key = `${params.studentId || "__unknown__"}:${vt}`;
+  const result = await createLiveCameraViolationIfEligible({
+    ...params,
+    skipCooldown: batchKeys.has(key),
+  });
+  if (result.created) batchKeys.add(key);
+  return result;
+}
+
+/** Upload a local evidence file as the public clip for a violation row. */
+async function uploadViolationClipFromPath(
+  violationId,
+  filePath,
+  contentType = "video/mp4",
+) {
+  const ext = String(contentType).includes("webm")
+    ? "webm"
+    : String(contentType).includes("png")
+      ? "png"
+      : String(contentType).includes("jpeg") || String(contentType).includes("jpg")
+        ? "jpg"
+        : "mp4";
+  const storagePath = `${violationId}.${ext}`;
+  const buffer = fs.readFileSync(filePath);
+
+  const { error: uploadErr } = await supabase.storage
+    .from("violation-clips")
+    .upload(storagePath, buffer, {
+      contentType: contentType || "video/mp4",
+      upsert: true,
+    });
+  if (uploadErr) {
+    throw new Error(`Storage upload failed: ${uploadErr.message}`);
+  }
+
+  const { data: urlData } = supabase.storage
+    .from("violation-clips")
+    .getPublicUrl(storagePath);
+  const clipUrl = urlData?.publicUrl;
+  if (!clipUrl) throw new Error("Could not get public URL after upload");
+
+  const { error: updateErr } = await supabase
+    .from("violations")
+    .update({ clip_url: clipUrl })
+    .eq("id", violationId);
+  if (updateErr) throw updateErr;
+
+  console.log(`[Clip] ✅ Evidence attached to violation ${violationId}`);
+  return clipUrl;
+}
+
 /* -------------------- Fine Enforcement Helper -------------------- */
 async function applyFineIfEligible(
   studentId,
   studentName,
   violationType,
   violationId,
+  { skipCooldown = false, manualViolationId = null } = {},
 ) {
   try {
     // Load all active policy rules once and pick the best match using a
@@ -454,26 +533,28 @@ async function applyFineIfEligible(
     );
 
     // Check 15-minute cooldown: same student + same violation type
-    const windowStart = new Date(Date.now() - VIOLATION_COOLDOWN_MS).toISOString();
-    const { data: recentFine } = await supabase
-      .from("fines")
-      .select("id, created_at")
-      .eq("student_id", studentId)
-      .ilike("violation_type", violationType)
-      .gte("created_at", windowStart)
-      .maybeSingle();
+    if (!skipCooldown) {
+      const windowStart = new Date(Date.now() - VIOLATION_COOLDOWN_MS).toISOString();
+      const { data: recentFine } = await supabase
+        .from("fines")
+        .select("id, created_at")
+        .eq("student_id", studentId)
+        .ilike("violation_type", violationType)
+        .gte("created_at", windowStart)
+        .maybeSingle();
 
-    if (recentFine) {
-      console.log(
-        `[Fine] Cooldown active for ${studentName} (${violationType}) — skipping fine`,
-      );
-      return {
-        applied: false,
-        reason: "cooldown_active",
-        cooldownUntil: new Date(
-          new Date(recentFine.created_at).getTime() + VIOLATION_COOLDOWN_MS,
-        ).toISOString(),
-      };
+      if (recentFine) {
+        console.log(
+          `[Fine] Cooldown active for ${studentName} (${violationType}) — skipping fine`,
+        );
+        return {
+          applied: false,
+          reason: "cooldown_active",
+          cooldownUntil: new Date(
+            new Date(recentFine.created_at).getTime() + VIOLATION_COOLDOWN_MS,
+          ).toISOString(),
+        };
+      }
     }
 
     // Insert the fine
@@ -483,7 +564,7 @@ async function applyFineIfEligible(
         student_id: studentId,
         student_name: studentName,
         violation_id: violationId || null,
-        manual_violation_id: null,
+        manual_violation_id: manualViolationId || null,
         violation_type: violationType.toLowerCase(),
         policy_rule_id: rule.id,
         amount: rule.penalty,
@@ -1047,7 +1128,7 @@ app.delete("/api/students/:id", authenticate, async (req, res) => {
 /* -------------------- Users (admin list) -------------------- */
 app.get("/api/users", authenticate, async (req, res) => {
   try {
-    if (req.user.role !== "admin")
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge")
       return res.status(403).json({ error: "Access denied" });
     const { data: rows, error } = await supabase
       .from("users")
@@ -1063,7 +1144,7 @@ app.get("/api/users", authenticate, async (req, res) => {
 });
 app.post("/api/users", authenticate, async (req, res) => {
   try {
-    if (req.user.role !== "admin")
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge")
       return res.status(403).json({ error: "Access denied" });
     const { email, password, name, role } = req.body;
     if (!email || !password)
@@ -1094,7 +1175,7 @@ app.post("/api/users", authenticate, async (req, res) => {
 });
 app.patch("/api/users/:id", authenticate, async (req, res) => {
   try {
-    if (req.user.role !== "admin")
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge")
       return res.status(403).json({ error: "Access denied" });
     const { name, email, role, password } = req.body;
     const updates = {};
@@ -1128,7 +1209,7 @@ app.patch("/api/users/:id", authenticate, async (req, res) => {
 });
 app.delete("/api/users/:id", authenticate, async (req, res) => {
   try {
-    if (req.user.role !== "admin")
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge")
       return res.status(403).json({ error: "Access denied" });
     const { error } = await supabase
       .from("users")
@@ -1146,7 +1227,7 @@ app.get("/api/violations", authenticate, async (req, res) => {
   try {
     const { data: rows, error } = await supabase
       .from("violations")
-      .select("*")
+      .select("*, students(roll_number)")
       .order("created_at", { ascending: false });
     if (error) throw error;
     res.json((rows || []).map(toClientViolation));
@@ -1159,7 +1240,7 @@ app.get("/api/violations/:id", authenticate, async (req, res) => {
   try {
     const { data: row, error } = await supabase
       .from("violations")
-      .select("*")
+      .select("*, students(roll_number)")
       .eq("id", req.params.id)
       .single();
     if (error) throw error;
@@ -1197,7 +1278,7 @@ app.post("/api/violations", internalAuth, async (req, res) => {
         camera_name: body.cameraName,
         status: body.status || "Unverified",
       })
-      .select()
+      .select("*, students(roll_number)")
       .single();
     if (error) throw error;
 
@@ -1619,30 +1700,71 @@ async function runManualViolationAiReview(manualViolationId) {
     };
 
     if (actionable.length > 0) {
-      const best = actionable[0];
-      const { data: student } = await supabase
-        .from("students")
-        .select("id, name")
-        .eq("id", best.student_id)
-        .maybeSingle();
-      const studentName = student?.name || best.student_name || "Student";
-      const violationResult = await createLiveCameraViolationIfEligible({
-        studentId: best.student_id,
-        studentName,
-        violationType: best.violation_type,
-        confidence: Number(best.confidence || 0),
-        severity: "HIGH",
-        status: "Verified",
-        location: row.location || "Mobile student report",
-      });
+      const evidenceMime =
+        row.evidence_media_type === "video" ? "video/mp4" : "image/jpeg";
+      const finesAppliedList = [];
+      const violationIds = [];
+      const noteParts = [];
 
-      const fineApplied = Boolean(violationResult.fineResult?.applied);
-      const fineAmount = violationResult.fineResult?.fine?.amount;
-      let reviewNote = fineApplied
-        ? `AI confirmed ${best.violation_type} for ${studentName}. Fine applied automatically${fineAmount != null ? ` (Rs. ${fineAmount})` : ""}.`
-        : `AI detected ${best.violation_type} for ${studentName}, but automatic fine was not applied (${violationResult.fineResult?.reason || "unknown"}). Staff review required.`;
+      for (const finding of actionable) {
+        const { data: student } = await supabase
+          .from("students")
+          .select("id, name")
+          .eq("id", finding.student_id)
+          .maybeSingle();
+        const studentName = student?.name || finding.student_name || "Student";
+        const violationResult = await createLiveCameraViolationIfEligible({
+          studentId: finding.student_id,
+          studentName,
+          violationType: finding.violation_type,
+          confidence: Number(finding.confidence || 0),
+          severity: "HIGH",
+          status: "Verified",
+          location: row.location || "Mobile student report",
+          skipCooldown: true,
+          manualViolationId,
+        });
 
-      if (fineApplied) {
+        if (violationResult.violationId) {
+          violationIds.push(violationResult.violationId);
+          try {
+            await uploadViolationClipFromPath(
+              violationResult.violationId,
+              tempPath,
+              evidenceMime,
+            );
+          } catch (clipErr) {
+            console.error(
+              `[Mobile AI] Clip attach failed for violation ${violationResult.violationId}:`,
+              clipErr.message,
+            );
+          }
+        }
+
+        const fineApplied = Boolean(violationResult.fineResult?.applied);
+        const fineAmount = violationResult.fineResult?.fine?.amount;
+        if (fineApplied) {
+          finesAppliedList.push({
+            type: finding.violation_type,
+            studentName,
+            amount: fineAmount,
+          });
+          noteParts.push(
+            `${finding.violation_type} → ${studentName}${fineAmount != null ? ` (Rs. ${fineAmount})` : ""}`,
+          );
+        } else {
+          noteParts.push(
+            `${finding.violation_type} → ${studentName} (no auto fine: ${violationResult.fineResult?.reason || "unknown"})`,
+          );
+        }
+      }
+
+      const anyFine = finesAppliedList.length > 0;
+      let reviewNote = anyFine
+        ? `AI confirmed ${finesAppliedList.length} violation(s) with automatic fines: ${noteParts.join("; ")}.`
+        : `AI detected violation(s) but no automatic fines were applied: ${noteParts.join("; ")}. Staff review required.`;
+
+      if (anyFine) {
         const rewardResult = await grantAiReportApprovalReward({
           manualViolationId,
           reporterUserId: row.reporter_user_id,
@@ -1655,9 +1777,9 @@ async function runManualViolationAiReview(manualViolationId) {
 
       updates = {
         ...updates,
-        status: fineApplied ? "approved" : "pending",
-        ai_status: fineApplied ? "auto_fined" : "detected_no_fine",
-        ai_violation_id: violationResult.violationId || null,
+        status: anyFine ? "approved" : "pending",
+        ai_status: anyFine ? "auto_fined" : "detected_no_fine",
+        ai_violation_id: violationIds[0] || null,
         review_note: reviewNote,
       };
     } else if (detectedUnknown) {
@@ -2074,6 +2196,351 @@ app.post("/api/mobile/fines/:id/pay", async (req, res) => {
   }
 });
 
+/* -------------------- Violation reports (incharge / admin) -------------------- */
+app.get("/api/reports/violations", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const [{ data: violations, error: vErr }, { data: students, error: sErr }, { data: fines, error: fErr }] =
+      await Promise.all([
+        supabase
+          .from("violations")
+          .select("id, student_id, student_name, type, severity, status, created_at"),
+        supabase.from("students").select("id, name, department, roll_number"),
+        supabase.from("fines").select("id, student_id, student_name, violation_type, amount, status"),
+      ]);
+    if (vErr) throw vErr;
+    if (sErr) throw sErr;
+    if (fErr) throw fErr;
+
+    const studentById = {};
+    for (const s of students || []) {
+      studentById[s.id] = s;
+    }
+
+    const byStudentMap = {};
+    const byTypeMap = {};
+    const byDeptMap = {};
+
+    for (const v of violations || []) {
+      const type = (v.type || "unknown").toLowerCase();
+      byTypeMap[type] = (byTypeMap[type] || 0) + 1;
+
+      if (!v.student_id) continue;
+      const st = studentById[v.student_id];
+      const dept = (st?.department || "Unknown").trim() || "Unknown";
+      const name = st?.name || v.student_name || "Student";
+      const key = v.student_id;
+
+      if (!byStudentMap[key]) {
+        byStudentMap[key] = {
+          studentId: key,
+          studentName: name,
+          department: dept,
+          rollNumber: st?.roll_number || null,
+          violationCount: 0,
+          fineCount: 0,
+          totalFineAmount: 0,
+        };
+      }
+      byStudentMap[key].violationCount += 1;
+      byDeptMap[dept] = (byDeptMap[dept] || 0) + 1;
+    }
+
+    for (const f of fines || []) {
+      if (!f.student_id) continue;
+      const st = studentById[f.student_id];
+      const key = f.student_id;
+      if (!byStudentMap[key]) {
+        byStudentMap[key] = {
+          studentId: key,
+          studentName: st?.name || f.student_name || "Student",
+          department: (st?.department || "Unknown").trim() || "Unknown",
+          rollNumber: st?.roll_number || null,
+          violationCount: 0,
+          fineCount: 0,
+          totalFineAmount: 0,
+        };
+      }
+      byStudentMap[key].fineCount += 1;
+      byStudentMap[key].totalFineAmount += Number(f.amount) || 0;
+    }
+
+    const byFineTypeMap = {};
+    for (const f of fines || []) {
+      const t = (f.violation_type || "unknown").toLowerCase();
+      if (!byFineTypeMap[t]) {
+        byFineTypeMap[t] = { type: t, count: 0, totalAmount: 0 };
+      }
+      byFineTypeMap[t].count += 1;
+      byFineTypeMap[t].totalAmount += Number(f.amount) || 0;
+    }
+
+    const topStudents = Object.values(byStudentMap)
+      .sort((a, b) => b.violationCount - a.violationCount || b.fineCount - a.fineCount)
+      .slice(0, 50);
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      totals: {
+        violations: (violations || []).length,
+        fines: (fines || []).length,
+        studentsWithViolations: Object.keys(byStudentMap).length,
+      },
+      topStudents,
+      byViolationType: Object.entries(byTypeMap)
+        .map(([type, count]) => ({ type, count }))
+        .sort((a, b) => b.count - a.count),
+      byDepartment: Object.entries(byDeptMap)
+        .map(([department, count]) => ({ department, count }))
+        .sort((a, b) => b.count - a.count),
+      finesByViolationType: Object.values(byFineTypeMap).sort(
+        (a, b) => b.count - a.count,
+      ),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* -------------------- Fine appeals -------------------- */
+app.get("/api/fine-appeals", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    const statusFilter = String(req.query.status || "").toLowerCase();
+    let query = supabase
+      .from("fine_appeals")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (statusFilter && ["pending", "approved", "rejected"].includes(statusFilter)) {
+      query = query.eq("status", statusFilter);
+    }
+    const { data: rows, error } = await query;
+    if (error) throw error;
+
+    const fineIds = [...new Set((rows || []).map((r) => r.fine_id).filter(Boolean))];
+    let finesById = {};
+    if (fineIds.length > 0) {
+      const { data: fineRows } = await supabase
+        .from("fines")
+        .select("*")
+        .in("id", fineIds);
+      for (const f of fineRows || []) finesById[f.id] = f;
+    }
+
+    res.json((rows || []).map((r) => toClientFineAppeal(r, finesById[r.fine_id])));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/fine-appeals/:id", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin" && req.user.role !== "discipline_incharge") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    const { status, reviewNote } = req.body || {};
+    const next = String(status || "").toLowerCase();
+    if (!["approved", "rejected"].includes(next)) {
+      return res.status(400).json({
+        error: "status must be approved (waive fine) or rejected",
+      });
+    }
+
+    const { data: appeal, error: aErr } = await supabase
+      .from("fine_appeals")
+      .select("*")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (aErr) throw aErr;
+    if (!appeal) return res.status(404).json({ error: "Appeal not found" });
+    if (appeal.status !== "pending") {
+      return res.status(400).json({ error: `Appeal is already ${appeal.status}` });
+    }
+
+    const reviewerLabel = req.user.name || req.user.email || "Staff";
+    const { data: updatedAppeal, error: updErr } = await supabase
+      .from("fine_appeals")
+      .update({
+        status: next,
+        review_note: reviewNote != null ? String(reviewNote).trim() || null : null,
+        reviewed_by_name: reviewerLabel,
+        reviewed_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (updErr) throw updErr;
+
+    let fineRow = null;
+    if (next === "approved") {
+      const { data: fine, error: fErr } = await supabase
+        .from("fines")
+        .update({ status: "Waived" })
+        .eq("id", appeal.fine_id)
+        .select()
+        .single();
+      if (fErr) throw fErr;
+      fineRow = fine;
+      await supabase.from("notifications").insert({
+        title: `Fine waived: ${appeal.student_name || "Student"} — appeal approved`,
+        priority: "MED",
+        read: false,
+      });
+    } else {
+      const { data: fine } = await supabase
+        .from("fines")
+        .select("*")
+        .eq("id", appeal.fine_id)
+        .maybeSingle();
+      fineRow = fine;
+      await supabase.from("notifications").insert({
+        title: `Fine appeal rejected for ${appeal.student_name || "Student"}`,
+        priority: "LOW",
+        read: false,
+      });
+    }
+
+    await supabase.from("activity_logs").insert({
+      action: next === "approved" ? "Fine appeal approved" : "Fine appeal rejected",
+      description:
+        next === "approved"
+          ? `Appeal approved — fine waived for ${appeal.student_name || "student"}.${reviewNote ? ` Note: ${reviewNote}` : ""}`
+          : `Appeal rejected for ${appeal.student_name || "student"}.${reviewNote ? ` Note: ${reviewNote}` : ""}`,
+      user_name: appeal.student_name || "Student",
+      related_id: String(appeal.fine_id),
+      icon: next === "approved" ? "CheckCircle" : "XCircle",
+      color: next === "approved" ? "green" : "red",
+    });
+
+    res.json(toClientFineAppeal(updatedAppeal, fineRow));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/mobile/fines/:id/appeal", async (req, res) => {
+  try {
+    const { studentUserId, message } = req.body || {};
+    if (!studentUserId) {
+      return res.status(400).json({ error: "studentUserId is required" });
+    }
+    const msg = String(message || "").trim();
+    if (msg.length < 10) {
+      return res.status(400).json({
+        error: "Please enter an appeal message (at least 10 characters)",
+      });
+    }
+
+    const { data: userRow, error: userErr } = await supabase
+      .from("users")
+      .select("id, student_id, role, name, email")
+      .eq("id", studentUserId)
+      .maybeSingle();
+    if (userErr) throw userErr;
+    if (!userRow || userRow.role !== "student") {
+      return res.status(403).json({ error: "Not allowed" });
+    }
+    if (!userRow.student_id) {
+      return res.status(400).json({ error: "Student account not linked to campus record" });
+    }
+
+    const { data: fine, error: fineErr } = await supabase
+      .from("fines")
+      .select("*")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (fineErr) throw fineErr;
+    if (!fine) return res.status(404).json({ error: "Fine not found" });
+    if (fine.student_id !== userRow.student_id) {
+      return res.status(403).json({ error: "This fine belongs to another student" });
+    }
+    if (fine.status !== "Pending") {
+      return res.status(400).json({
+        error: `Only pending fines can be appealed (current: ${fine.status})`,
+      });
+    }
+
+    const { data: existing } = await supabase
+      .from("fine_appeals")
+      .select("id, status")
+      .eq("fine_id", fine.id)
+      .eq("status", "pending")
+      .maybeSingle();
+    if (existing) {
+      return res.status(400).json({ error: "An appeal is already pending for this fine" });
+    }
+
+    const { data: student } = await supabase
+      .from("students")
+      .select("name")
+      .eq("id", userRow.student_id)
+      .maybeSingle();
+
+    const { data: appealRow, error: insErr } = await supabase
+      .from("fine_appeals")
+      .insert({
+        fine_id: fine.id,
+        student_id: userRow.student_id,
+        student_user_id: userRow.id,
+        student_name: student?.name || userRow.name || userRow.email,
+        message: msg.slice(0, 2000),
+        status: "pending",
+      })
+      .select()
+      .single();
+    if (insErr) throw insErr;
+
+    await supabase.from("notifications").insert({
+      title: `Fine appeal submitted: ${student?.name || userRow.name || "Student"}`,
+      priority: "HIGH",
+      read: false,
+    });
+
+    res.status(201).json({ ok: true, appeal: toClientFineAppeal(appealRow, fine) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/mobile/fine-appeals", async (req, res) => {
+  try {
+    const studentUserId = req.query.studentUserId;
+    if (!studentUserId) {
+      return res.status(400).json({ error: "studentUserId is required" });
+    }
+    const { data: userRow, error: userErr } = await supabase
+      .from("users")
+      .select("id, student_id, role")
+      .eq("id", studentUserId)
+      .maybeSingle();
+    if (userErr) throw userErr;
+    if (!userRow || userRow.role !== "student") {
+      return res.status(403).json({ error: "Not allowed" });
+    }
+
+    let query = supabase
+      .from("fine_appeals")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (userRow.student_id) {
+      query = query.eq("student_id", userRow.student_id);
+    } else {
+      query = query.eq("student_user_id", userRow.id);
+    }
+    const { data: rows, error } = await query;
+    if (error) throw error;
+
+    res.json((rows || []).map((r) => toClientFineAppeal(r, null)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* -------------------- Rewards -------------------- */
 function toClientReward(row) {
   if (!row) return null;
@@ -2353,7 +2820,7 @@ app.get("/api/review-queue", authenticate, async (req, res) => {
     }
     const { data: rows, error } = await supabase
       .from("violations")
-      .select("*")
+      .select("*, students(roll_number)")
       .eq("status", "PendingReview")
       .order("created_at", { ascending: false });
     if (error) throw error;
@@ -2379,10 +2846,26 @@ app.patch("/api/review-queue/:id/approve", authenticate, async (req, res) => {
       .single();
     if (fetchErr || !violation)
       return res.status(404).json({ error: "Violation not found" });
-    if (violation.status !== "PendingReview") {
-      return res
-        .status(400)
-        .json({ error: "Violation is not in PendingReview status" });
+
+    // Clean up and refund any existing fine before applying the new review decision
+    const { data: existingFine } = await supabase
+      .from("fines")
+      .select("*")
+      .eq("violation_id", req.params.id)
+      .maybeSingle();
+
+    if (existingFine) {
+      if (existingFine.status === "Paid" && existingFine.student_id) {
+        const refundPoints = Math.ceil(Number(existingFine.amount) || 0);
+        await supabase.from("rewards").insert({
+          student_id: existingFine.student_id,
+          student_name: existingFine.student_name || "Student",
+          points: refundPoints,
+          description: `Refund: Reassigned/Updated violation [${req.params.id}]`,
+          issued_by: "System Review",
+        });
+      }
+      await supabase.from("fines").delete().eq("id", existingFine.id);
     }
 
     // Resolve student details if provided
@@ -2401,12 +2884,15 @@ app.patch("/api/review-queue/:id/approve", authenticate, async (req, res) => {
     if (studentId) {
       updates.student_id = studentId;
       updates.student_name = studentName;
+    } else {
+      updates.student_id = null;
+      updates.student_name = "Unknown";
     }
     const { data: updated, error: updateErr } = await supabase
       .from("violations")
       .update(updates)
       .eq("id", req.params.id)
-      .select()
+      .select("*, students(roll_number)")
       .single();
     if (updateErr) throw updateErr;
 
@@ -2421,50 +2907,36 @@ app.patch("/api/review-queue/:id/approve", authenticate, async (req, res) => {
           .eq("id", policyRuleId)
           .single();
         if (rule) {
-          const windowStart = new Date(
-            Date.now() - 15 * 60 * 1000,
-          ).toISOString();
-          const { data: recentFine } = await supabase
+          const { data: fineRow } = await supabase
             .from("fines")
-            .select("id")
-            .eq("student_id", studentId)
-            .eq("policy_rule_id", policyRuleId)
-            .gte("created_at", windowStart)
-            .maybeSingle();
-          if (!recentFine) {
-            const { data: fineRow } = await supabase
-              .from("fines")
-              .insert({
-                student_id: studentId,
-                student_name: studentName,
-                violation_id: req.params.id,
-                manual_violation_id: null,
-                violation_type: violation.type,
-                policy_rule_id: rule.id,
-                amount: rule.penalty,
-                status: "Pending",
-              })
-              .select()
-              .single();
-            await supabase.from("notifications").insert({
-              title: `Fine Applied: ${studentName} — Rs. ${rule.penalty} for ${rule.title}`,
+            .insert({
+              student_id: studentId,
+              student_name: studentName,
               violation_id: req.params.id,
-              priority:
-                rule.severity === "HIGH"
-                  ? "HIGH"
-                  : rule.severity === "LOW"
-                    ? "LOW"
-                    : "MED",
-              read: false,
-            });
-            fineResult = {
-              applied: true,
-              fine: toClientFine(fineRow),
-              rule: toClientPolicyRule(rule),
-            };
-          } else {
-            fineResult = { applied: false, reason: "cooldown_active" };
-          }
+              manual_violation_id: null,
+              violation_type: violation.type,
+              policy_rule_id: rule.id,
+              amount: rule.penalty,
+              status: "Pending",
+            })
+            .select()
+            .single();
+          await supabase.from("notifications").insert({
+            title: `Fine Applied: ${studentName} — Rs. ${rule.penalty} for ${rule.title}`,
+            violation_id: req.params.id,
+            priority:
+              rule.severity === "HIGH"
+                ? "HIGH"
+                : rule.severity === "LOW"
+                  ? "LOW"
+                  : "MED",
+            read: false,
+          });
+          fineResult = {
+            applied: true,
+            fine: toClientFine(fineRow),
+            rule: toClientPolicyRule(rule),
+          };
         }
       } else {
         // Auto-match by violation type
@@ -2489,11 +2961,33 @@ app.patch("/api/review-queue/:id/reject", authenticate, async (req, res) => {
     if (req.user.role !== "admin" && req.user.role !== "discipline_incharge") {
       return res.status(403).json({ error: "Access denied" });
     }
+
+    // Clean up and refund any existing fine associated with this dismissed violation
+    const { data: existingFine } = await supabase
+      .from("fines")
+      .select("*")
+      .eq("violation_id", req.params.id)
+      .maybeSingle();
+
+    if (existingFine) {
+      if (existingFine.status === "Paid" && existingFine.student_id) {
+        const refundPoints = Math.ceil(Number(existingFine.amount) || 0);
+        await supabase.from("rewards").insert({
+          student_id: existingFine.student_id,
+          student_name: existingFine.student_name || "Student",
+          points: refundPoints,
+          description: `Refund: Dismissed violation [${req.params.id}]`,
+          issued_by: "System Review",
+        });
+      }
+      await supabase.from("fines").delete().eq("id", existingFine.id);
+    }
+
     const { data: updated, error } = await supabase
       .from("violations")
       .update({ status: "Dismissed" })
       .eq("id", req.params.id)
-      .select()
+      .select("*, students(roll_number)")
       .single();
     if (error) throw error;
     res.json(toClientViolation(updated));
@@ -2953,6 +3447,7 @@ app.post("/api/recognition/live", authenticate, async (req, res) => {
     // Enrich weapon detections with student names, auto-create violations + fines
     const weaponDetections = [];
     const finesApplied = [];
+    const liveBatchKeys = new Set();
 
     for (const w of weaponDetectionsRaw) {
       const entry = {
@@ -2978,7 +3473,7 @@ app.post("/api/recognition/live", authenticate, async (req, res) => {
               `⚠ Weapon (${w.weapon}) held by: ${student.name} (${w.student_id})`,
             );
 
-            const result = await createLiveCameraViolationIfEligible({
+            const result = await createLiveCameraViolationForBatch(liveBatchKeys, {
               studentId: student._id,
               studentName: student.name,
               violationType: w.weapon,
@@ -3013,7 +3508,7 @@ app.post("/api/recognition/live", authenticate, async (req, res) => {
       if (!w.student_id) {
         try {
           const weaponType = (w.weapon || "unknown").toLowerCase();
-          const result = await createLiveCameraViolationIfEligible({
+          const result = await createLiveCameraViolationForBatch(liveBatchKeys, {
             studentId: null,
             studentName: "Unknown",
             violationType: weaponType,
@@ -3057,7 +3552,7 @@ app.post("/api/recognition/live", authenticate, async (req, res) => {
         const student = primaryRec?.student;
         const fightConf = fightDetection.confidence;
         if (student) {
-          const result = await createLiveCameraViolationIfEligible({
+          const result = await createLiveCameraViolationForBatch(liveBatchKeys, {
             studentId: student._id,
             studentName: student.name,
             violationType: "fight",
@@ -3090,7 +3585,7 @@ app.post("/api/recognition/live", authenticate, async (req, res) => {
       try {
         const student = primaryRec?.student;
         if (student) {
-          const result = await createLiveCameraViolationIfEligible({
+          const result = await createLiveCameraViolationForBatch(liveBatchKeys, {
             studentId: student._id,
             studentName: student.name,
             violationType: dc.type,

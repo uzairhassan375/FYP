@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { Card, CardContent } from "../../components/Card";
 import { Bell, Eye, Check, X, Loader2, AlertCircle, RefreshCw, ShieldAlert, Video } from "lucide-react";
 import { apiGet, apiPatch } from "../../lib/api";
@@ -16,6 +17,7 @@ function priorityColor(severity) {
 }
 
 export default function ReviewQueue() {
+  const navigate = useNavigate();
   const [queue, setQueue] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -77,7 +79,13 @@ export default function ReviewQueue() {
           >
             <RefreshCw className="w-5 h-5" />
           </button>
-          <Bell className="w-6 h-6 text-slate-500" />
+          <button
+            onClick={() => navigate("/incharge/notifications")}
+            className="p-2 rounded-lg hover:bg-slate-100 text-slate-500 transition-colors"
+            title="Notifications"
+          >
+            <Bell className="w-6 h-6" />
+          </button>
           <div className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center font-medium">
             S
           </div>

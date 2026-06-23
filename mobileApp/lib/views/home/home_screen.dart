@@ -146,7 +146,6 @@ class HomeContentState extends State<HomeContent> {
         for (final row in rlist) {
           final m = row as Map<String, dynamic>;
           final p = m['points'];
-          if (p is int) rewardSum += p;
           if (p is num) rewardSum += p.toInt();
         }
 
@@ -280,33 +279,98 @@ class HomeContentState extends State<HomeContent> {
                   ],
                 ),
                 const SizedBox(height: 16),
-                Row(
-                  children: [
-                    const Icon(Icons.card_giftcard, color: Colors.white, size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      StudentSession.instance.user?.studentId == null ||
-                              StudentSession.instance.user!.studentId!.trim().isEmpty
-                          ? 'Link student profile for rewards'
-                          : '$_rewardPoints Points',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: Colors.white.withOpacity(0.2), width: 1),
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.2),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(Icons.stars_rounded, color: Colors.amber, size: 22),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Reward Points',
+                                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    StudentSession.instance.user?.studentId == null ||
+                                            StudentSession.instance.user!.studentId!.trim().isEmpty
+                                        ? 'Not Linked'
+                                        : '$_rewardPoints Pts',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 16),
-                    const Icon(Icons.account_balance_wallet_outlined, color: Colors.white, size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      _finesLabel(),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
+                      Container(
+                        height: 36,
+                        width: 1,
+                        color: Colors.white.withOpacity(0.2),
                       ),
-                    ),
-                  ],
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.2),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(Icons.account_balance_wallet_rounded, color: Colors.white, size: 22),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Outstanding',
+                                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'Rs. ${_outstandingFines.toStringAsFixed(0)}',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),

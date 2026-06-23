@@ -51,6 +51,14 @@ export default function ApproveViolationModal({ violation, onClose, onDone }) {
         setPolicyRules(rules);
         const auto = findMatchingPolicyRule(rules, violation?.type);
         setSelectedRule(auto || null);
+
+        // Pre-select the currently linked student if it exists
+        const linkedId = violation?.studentId ?? violation?.student_id;
+        if (linkedId) {
+          const targetId = typeof linkedId === "object" ? (linkedId._id || linkedId.id) : linkedId;
+          const matched = studs.find((s) => (s._id || s.id) === targetId);
+          if (matched) setSelectedStudent(matched);
+        }
       } catch (err) {
         setError(err.message);
       } finally {
@@ -58,7 +66,7 @@ export default function ApproveViolationModal({ violation, onClose, onDone }) {
         setTimeout(() => searchRef.current?.focus(), 100);
       }
     })();
-  }, [violation?.type]);
+  }, [violation?.type, violation?.studentId, violation?.student_id]);
 
   /* keyboard: Escape to close */
   useEffect(() => {

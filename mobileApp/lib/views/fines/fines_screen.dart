@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/env.dart';
 import '../../core/student_session.dart';
+import '../../services/appeal_service.dart';
 import '../../services/fine_service.dart';
 import '../../widgets/shared/status_tag.dart';
 
@@ -35,10 +36,13 @@ class _FinesScreenState extends State<FinesScreen> {
   bool _loading = true;
   String? _error;
   String? _payingFineId;
+  String? _appealingFineId;
   int _rewardBalance = 0;
+  final Map<String, String> _appealStatusByFineId = {};
   Timer? _poll;
 
   final FineService _fineService = FineService();
+  final AppealService _appealService = AppealService();
 
   @override
   void initState() {
@@ -105,6 +109,7 @@ class _FinesScreenState extends State<FinesScreen> {
 
       await _loadViolationClips(list);
       await _loadManualReportEvidence(list);
+      await _loadAppeals();
       if (mounted) {
         setState(() {
           _rows = list;
@@ -299,6 +304,111 @@ class _FinesScreenState extends State<FinesScreen> {
     return _totalAmount(_rows.where((r) => _normStatus(r) == 'Pending'));
   }
 
+  Future<void> _loadAppeals() async {
+    if (!Env.hasSupabaseConfig || StudentSession.instance.user == null) {
+      if (mounted) setState(() => _appealStatusByFineId.clear());
+      return;
+    }
+    try {
+      final appeals = await _appealService.fetchMyAppeals();
+      final next = <String, String>{};
+      for (final a in appeals) {
+        final fid = '${a['fineId'] ?? a['fine_id'] ?? ''}'.trim();
+        final st = (a['status'] as String? ?? 'pending').toLowerCase();
+        if (fid.isNotEmpty) next[fid] = st;
+      }
+      if (mounted) {
+        setState(() {
+          _appealStatusByFineId
+            ..clear()
+            ..addAll(next);
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _appealStatusByFineId.clear());
+    }
+  }
+
+  Future<void> _submitAppeal({
+    required String fineId,
+    required String title,
+  }) async {
+    final controller = TextEditingController();
+    final submitted = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Appeal fine'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Explain why this fine for $title should be reviewed (min. 10 characters).',
+                style: const TextStyle(fontSize: 14),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                maxLines: 4,
+                maxLength: 2000,
+                decoration: const InputDecoration(
+                  hintText: 'Your message to discipline incharge…',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Submit appeal'),
+          ),
+        ],
+      ),
+    );
+
+    if (submitted != true || !mounted) return;
+    final message = controller.text.trim();
+    if (message.length < 10) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter at least 10 characters.'),
+          backgroundColor: Color(0xFFB71C1C),
+        ),
+      );
+      return;
+    }
+
+    setState(() => _appealingFineId = fineId);
+    try {
+      await _appealService.submitAppeal(fineId: fineId, message: message);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Appeal submitted. Discipline incharge will review it.'),
+          backgroundColor: Color(0xFF4CAF50),
+        ),
+      );
+      await _loadAppeals();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          backgroundColor: const Color(0xFFB71C1C),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _appealingFineId = null);
+    }
+  }
+
   String _dateLabel(String? iso) {
     if (iso == null || iso.isEmpty) return '—';
     try {
@@ -338,12 +448,9 @@ class _FinesScreenState extends State<FinesScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Pay with reward points'),
+        title: const Text('Pay fine'),
         content: Text(
-          'Pay $pointsRequired reward points for $title?\n\n'
-          'Fine amount: Rs. ${amount.toStringAsFixed(0)} (1 point = Rs. 1)\n'
-          'Your balance: $_rewardBalance points\n'
-          'After payment: ${_rewardBalance - pointsRequired} points',
+          'Pay Rs. ${amount.toStringAsFixed(0)} for $title?',
         ),
         actions: [
           TextButton(
@@ -362,12 +469,12 @@ class _FinesScreenState extends State<FinesScreen> {
 
     setState(() => _payingFineId = fineId);
     try {
-      final result = await _fineService.payFine(fineId: fineId);
+      await _fineService.payFine(fineId: fineId);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Paid $pointsRequired points for $title. Balance: ${result.remainingBalance} points.',
+            'Paid Rs. ${amount.toStringAsFixed(0)} for $title.',
           ),
           backgroundColor: const Color(0xFF4CAF50),
         ),
@@ -606,6 +713,7 @@ class _FinesScreenState extends State<FinesScreen> {
                                     violationClipUrl: clip,
                                     reportEvidence: reportEv,
                                     rewardBalance: _rewardBalance,
+                                    appealStatus: _appealStatusByFineId['${r['id']}'],
                                   );
                                 },
                               ),
@@ -668,6 +776,7 @@ class _FinesScreenState extends State<FinesScreen> {
     String? violationClipUrl,
     _ManualReportEvidence? reportEvidence,
     required int rewardBalance,
+    String? appealStatus,
   }) {
     final clip = violationClipUrl?.trim();
     final hasClip = clip != null && clip.isNotEmpty;
@@ -675,6 +784,9 @@ class _FinesScreenState extends State<FinesScreen> {
     final isImage = hasClip && !isVideo && _clipLooksImage(clip);
     final pointsRequired = amount.ceil();
     final canPayWithPoints = rewardBalance >= pointsRequired;
+    final appeal = (appealStatus ?? '').toLowerCase();
+    final hasAppeal = appeal.isNotEmpty;
+    final appealPending = appeal == 'pending';
 
     final repUrl = reportEvidence?.url.trim();
     final hasReport = repUrl != null && repUrl.isNotEmpty;
@@ -730,124 +842,131 @@ class _FinesScreenState extends State<FinesScreen> {
             ),
           ],
           if (hasReport) ...[
-            const SizedBox(height: 12),
-            const Text(
-              'Evidence (report attachment)',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF333333)),
-            ),
-            const SizedBox(height: 8),
-            if (repIsImage)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: AspectRatio(
-                  aspectRatio: 16 / 9,
-                  child: Image.network(
-                    repUrl,
-                    fit: BoxFit.cover,
-                    loadingBuilder: (_, child, p) =>
-                        p == null ? child : const Center(child: CircularProgressIndicator(strokeWidth: 2)),
-                    errorBuilder: (_, __, ___) =>
-                        _clipOpenRow(context, repUrl, isVideo: false),
-                  ),
-                ),
-              )
-            else
-              _clipOpenRow(context, repUrl, isVideo: repIsVideo),
+            const SizedBox(height: 10),
+            _clipOpenRow(context, repUrl, isVideo: repIsVideo, label: 'Report Evidence'),
           ] else if (fine['manual_violation_id'] != null) ...[
             const SizedBox(height: 8),
             Text(
-              'Report evidence is not available (check storage access or run DB migration for manual_violation_id).',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              'Report evidence is not available.',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontStyle: FontStyle.italic),
             ),
           ],
           if (hasClip) ...[
-            const SizedBox(height: 12),
-            const Text(
-              'Evidence (camera clip)',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF333333)),
-            ),
-            const SizedBox(height: 8),
-            if (isImage)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: AspectRatio(
-                  aspectRatio: 16 / 9,
-                  child: Image.network(
-                    clip,
-                    fit: BoxFit.cover,
-                    loadingBuilder: (_, child, p) =>
-                        p == null ? child : const Center(child: CircularProgressIndicator(strokeWidth: 2)),
-                    errorBuilder: (_, __, ___) =>
-                        _clipOpenRow(context, clip, isVideo: false),
-                  ),
-                ),
-              )
-            else
-              _clipOpenRow(context, clip, isVideo: isVideo),
+            const SizedBox(height: 10),
+            _clipOpenRow(context, clip, isVideo: isVideo, label: 'Camera Violation Clip'),
           ] else if (fine['violation_id'] != null) ...[
             const SizedBox(height: 8),
             Text(
-              'No clip stored for this violation yet.',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              'Camera clip is not available.',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500, fontStyle: FontStyle.italic),
             ),
           ],
           const SizedBox(height: 12),
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Amount',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Color(0xFF999999),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Amount',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF999999),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Rs. ${amount.toStringAsFixed(0)} ($pointsRequired pts)',
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFFF44336),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Rs. ${amount.toStringAsFixed(0)}',
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFFF44336),
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
               if (status == 'Pending')
-                ElevatedButton(
-                  onPressed: _payingFineId == fineId || !canPayWithPoints
-                      ? null
-                      : () => _confirmAndPayFine(
-                            fineId: fineId,
-                            title: title,
-                            amount: amount,
-                          ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2196F3),
-                    foregroundColor: Colors.white,
-                    disabledBackgroundColor: const Color(0xFFBDBDBD),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ElevatedButton(
+                      onPressed: _payingFineId == fineId || !canPayWithPoints || appealPending
+                          ? null
+                          : () => _confirmAndPayFine(
+                                fineId: fineId,
+                                title: title,
+                                amount: amount,
+                              ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF2196F3),
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: const Color(0xFFBDBDBD),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      ),
+                      child: _payingFineId == fineId
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : Text(canPayWithPoints ? 'Pay' : 'Insufficient balance'),
                     ),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  ),
-                  child: _payingFineId == fineId
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
+                    if (!hasAppeal) ...[
+                      const SizedBox(width: 8),
+                      OutlinedButton(
+                        onPressed: _appealingFineId == fineId
+                            ? null
+                            : () => _submitAppeal(fineId: fineId, title: title),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF2196F3),
+                          side: const BorderSide(color: Color(0xFF2196F3)),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
                           ),
-                        )
-                      : Text(canPayWithPoints ? 'Pay with points' : 'Need $pointsRequired pts'),
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        ),
+                        child: _appealingFineId == fineId
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Text('Appeal'),
+                      ),
+                    ],
+                  ],
                 ),
             ],
           ),
-          if (status == 'Pending' && !canPayWithPoints) ...[
+          if (status == 'Pending' && appealPending) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Appeal pending review by discipline incharge.',
+              style: TextStyle(fontSize: 11, color: Colors.blue.shade700),
+            ),
+          ] else if (hasAppeal && appeal == 'approved') ...[
+            const SizedBox(height: 8),
+            Text(
+              'Appeal approved — fine waived.',
+              style: TextStyle(fontSize: 11, color: Colors.green.shade700),
+            ),
+          ] else if (hasAppeal && appeal == 'rejected') ...[
+            const SizedBox(height: 8),
+            Text(
+              'Appeal rejected. You may pay the fine or contact incharge.',
+              style: TextStyle(fontSize: 11, color: Colors.orange.shade800),
+            ),
+          ],
+          if (status == 'Pending' && !canPayWithPoints && !appealPending) ...[
             const SizedBox(height: 8),
             Text(
               'Earn reward points by submitting reports that AI confirms (500 pts each).',
@@ -873,34 +992,44 @@ class _FinesScreenState extends State<FinesScreen> {
     );
   }
 
-  Widget _clipOpenRow(BuildContext context, String url, {required bool isVideo}) {
+  Widget _clipOpenRow(BuildContext context, String url, {required bool isVideo, required String label}) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        color: const Color(0xFFF5F5F5),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFFE0E0E0)),
+        color: const Color(0xFFF9F9F9),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFEEEEEE)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Row(
             children: [
-              Icon(isVideo ? Icons.videocam : Icons.perm_media, color: const Color(0xFF2196F3)),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  isVideo ? 'Video clip' : 'Open evidence',
-                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                ),
+              Icon(
+                isVideo ? Icons.videocam_rounded : Icons.image_rounded,
+                color: isVideo ? Colors.red.shade400 : Colors.blue.shade400,
+                size: 20,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                label,
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Color(0xFF444444)),
               ),
             ],
           ),
           TextButton.icon(
             onPressed: () => _openUrl(context, url),
-            icon: const Icon(Icons.open_in_new, size: 18),
-            label: Text(isVideo ? 'Play / download' : 'Open in browser'),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            icon: const Icon(Icons.open_in_new_rounded, size: 14, color: Color(0xFF2196F3)),
+            label: Text(
+              isVideo ? 'Watch Clip' : 'View Image',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF2196F3), fontWeight: FontWeight.bold),
+            ),
           ),
         ],
       ),

@@ -610,12 +610,20 @@ export default function LiveRecognitionPanel({ onClose, cameras = [] }) {
                         console.log(`[Detection] Dresscode: ${data.dresscodeViolations.map(d => d.type).join(", ")}`);
                     }
 
-                    // Upload frame-based clip for every violation / review-queue entry created
-                    if (data.weaponDetections?.length > 0) {
-                        for (const w of data.weaponDetections) {
-                            const vid = w.violationId || w.reviewViolationId;
-                            if (vid) uploadFramesAsClip(vid);
-                        }
+                    // Upload frame-based clip for every violation created this frame
+                    const clipViolationIds = new Set();
+                    for (const w of data.weaponDetections || []) {
+                        const vid = w.violationId || w.reviewViolationId;
+                        if (vid) clipViolationIds.add(vid);
+                    }
+                    if (data.fightDetection?.violationId) {
+                        clipViolationIds.add(data.fightDetection.violationId);
+                    }
+                    for (const dc of data.dresscodeViolations || []) {
+                        if (dc.violationId) clipViolationIds.add(dc.violationId);
+                    }
+                    for (const vid of clipViolationIds) {
+                        uploadFramesAsClip(vid);
                     }
 
                     setRecognitions(data.recognitions || []);

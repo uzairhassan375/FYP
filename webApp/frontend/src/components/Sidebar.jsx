@@ -114,12 +114,6 @@ function SidebarContent({ items, isExpanded, location, toggleSidebar, isMobile, 
                             >
                                 <div className="relative shrink-0">
                                     {item.icon && <item.icon className={`w-5 h-5 transition-colors ${isActive ? "text-white" : "text-slate-400 group-hover:text-white"}`} />}
-                                    {item.badge && (
-                                        <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
-                                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                                            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
-                                        </span>
-                                    )}
                                 </div>
 
                                 <span className={`font-medium whitespace-nowrap transition-all duration-300 ${isExpanded ? "opacity-100 translate-x-0" : "opacity-0 -translate-x-4 absolute"

@@ -1,5 +1,4 @@
 import Topbar from "../../components/Topbar";
-import ViolationsFilters from "../../components/ViolationsFilters";
 import ViolationsTableFull from "../../components/ViolationsTableFull";
 
 export default function Violations() {
@@ -15,9 +14,9 @@ export default function Violations() {
           </p>
         </div>
 
-        <ViolationsFilters />
         <ViolationsTableFull />
       </div>
     </>
   );
 }
+

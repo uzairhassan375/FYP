@@ -98,6 +98,22 @@ CREATE INDEX IF NOT EXISTS idx_fines_student_id ON fines(student_id);
 CREATE INDEX IF NOT EXISTS idx_fines_manual_violation_id ON fines(manual_violation_id);
 CREATE INDEX IF NOT EXISTS idx_fines_created_at ON fines(created_at DESC);
 
+-- Fine appeals (see mobileApp/sql/fine_appeals.sql for RLS migration)
+CREATE TABLE IF NOT EXISTS fine_appeals (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  fine_id UUID NOT NULL REFERENCES fines(id) ON DELETE CASCADE,
+  student_id UUID REFERENCES students(id) ON DELETE SET NULL,
+  student_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  student_name TEXT,
+  message TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected')),
+  review_note TEXT,
+  reviewed_by_name TEXT,
+  reviewed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Rewards (issued by discipline_incharge to well-behaved students)
 CREATE TABLE IF NOT EXISTS rewards (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
