@@ -129,6 +129,13 @@ CREATE INDEX IF NOT EXISTS idx_rewards_student_id ON rewards(student_id);
 CREATE INDEX IF NOT EXISTS idx_rewards_created_at ON rewards(created_at DESC);
 ALTER TABLE rewards ENABLE ROW LEVEL SECURITY;
 
+-- System settings (admin-configurable)
+CREATE TABLE IF NOT EXISTS system_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Activity / history logs (runtime)
 CREATE TABLE IF NOT EXISTS activity_logs (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -148,5 +155,6 @@ ALTER TABLE violations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cameras ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE policy_rules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE system_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE activity_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE fines ENABLE ROW LEVEL SECURITY;

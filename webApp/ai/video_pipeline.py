@@ -360,6 +360,8 @@ class DetectorPipeline:
         self._load_dresscode_model()
 
         self._last_violation: Dict[tuple, float] = {}
+        self._violation_cooldown_sec = float(VIOLATION_COOLDOWN_SEC)
+        self._cooldown_fetched_at = 0.0
         self.pipeline_location = "Camera Feed"
         self.pipeline_camera_id = None
         self.pipeline_camera_name = None
@@ -372,6 +374,26 @@ class DetectorPipeline:
         if camera_name is not None:
             self.pipeline_camera_name = camera_name
 
+    def _get_violation_cooldown_sec(self) -> float:
+        now = time.time()
+        if self._cooldown_fetched_at and now - self._cooldown_fetched_at < 60:
+            return self._violation_cooldown_sec
+        try:
+            response = requests.get(
+                f"{BACKEND_URL}/api/internal/violation-cooldown",
+                headers={"X-AI-Secret-Key": AI_SECRET_KEY},
+                timeout=3,
+            )
+            if response.ok:
+                payload = response.json()
+                seconds = float(payload.get("seconds", VIOLATION_COOLDOWN_SEC))
+                if seconds > 0:
+                    self._violation_cooldown_sec = seconds
+                    self._cooldown_fetched_at = now
+        except Exception as e:
+            print(f"[AI] Cooldown fetch failed, using default: {e}")
+        return self._violation_cooldown_sec
+
     def _maybe_report_violation(
         self,
         violation_type: str,
@@ -381,7 +403,8 @@ class DetectorPipeline:
     ) -> None:
         key = (str(violation_type).lower(), student_id or "__unknown__")
         now = time.time()
-        if key in self._last_violation and now - self._last_violation[key] < VIOLATION_COOLDOWN_SEC:
+        cooldown_sec = self._get_violation_cooldown_sec()
+        if key in self._last_violation and now - self._last_violation[key] < cooldown_sec:
             return
         self._last_violation[key] = now
         report_violation(

@@ -15,6 +15,7 @@ import Cameras from "./pages/admin/Cameras";
 import HistoryLogs from "./pages/admin/HistoryLogs";
 import Notifications from "./pages/admin/Notifications";
 import PolicyRules from "./pages/admin/PolicyRules";
+import SystemSettings from "./pages/admin/SystemSettings";
 import Students from "./pages/admin/Students";
 import UsersPage from "./pages/admin/Users";
 import Violations from "./pages/admin/Violations";
@@ -51,6 +52,7 @@ export default function App() {
           <Route path="/history-logs" element={<HistoryLogs />} />
           <Route path="/notifications" element={<Notifications />} />
           <Route path="/policy-rules" element={<PolicyRules />} />
+          <Route path="/system-settings" element={<SystemSettings />} />
           <Route path="/students" element={<Students />} />
           <Route path="/users" element={<UsersPage />} />
           <Route path="/violations" element={<Violations />} />

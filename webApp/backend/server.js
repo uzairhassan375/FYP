@@ -325,12 +325,79 @@ function findPolicyRuleForViolation(allRules, violationType) {
   return allRules.find((r) => !r.violation_type) || null;
 }
 
-const VIOLATION_COOLDOWN_MS = 15 * 60 * 1000;
+const DEFAULT_VIOLATION_COOLDOWN_MINUTES = 15;
+const SETTING_KEY_VIOLATION_COOLDOWN = "violation_cooldown_minutes";
+const COOLDOWN_SETTING_CACHE_TTL_MS = 30_000;
 
-/** Recent camera violation for the same student (or unknown) + type within 15 minutes. */
+let cachedViolationCooldownMinutes = null;
+let violationCooldownCacheAt = 0;
+
+function clampCooldownMinutes(minutes) {
+  const n = Math.round(Number(minutes));
+  if (!Number.isFinite(n)) return DEFAULT_VIOLATION_COOLDOWN_MINUTES;
+  return Math.min(1440, Math.max(1, n));
+}
+
+function invalidateViolationCooldownCache() {
+  cachedViolationCooldownMinutes = null;
+  violationCooldownCacheAt = 0;
+}
+
+async function getViolationCooldownMinutes() {
+  const now = Date.now();
+  if (
+    cachedViolationCooldownMinutes != null &&
+    now - violationCooldownCacheAt < COOLDOWN_SETTING_CACHE_TTL_MS
+  ) {
+    return cachedViolationCooldownMinutes;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("system_settings")
+      .select("value")
+      .eq("key", SETTING_KEY_VIOLATION_COOLDOWN)
+      .maybeSingle();
+    if (error) throw error;
+    cachedViolationCooldownMinutes = clampCooldownMinutes(
+      data?.value ?? DEFAULT_VIOLATION_COOLDOWN_MINUTES,
+    );
+  } catch (err) {
+    console.warn(
+      "[Settings] Using default violation cooldown:",
+      err.message,
+    );
+    cachedViolationCooldownMinutes = DEFAULT_VIOLATION_COOLDOWN_MINUTES;
+  }
+
+  violationCooldownCacheAt = now;
+  return cachedViolationCooldownMinutes;
+}
+
+async function getViolationCooldownMs() {
+  return (await getViolationCooldownMinutes()) * 60 * 1000;
+}
+
+async function ensureSystemSettings() {
+  const { data } = await supabase
+    .from("system_settings")
+    .select("key")
+    .eq("key", SETTING_KEY_VIOLATION_COOLDOWN)
+    .maybeSingle();
+  if (!data) {
+    await supabase.from("system_settings").insert({
+      key: SETTING_KEY_VIOLATION_COOLDOWN,
+      value: String(DEFAULT_VIOLATION_COOLDOWN_MINUTES),
+    });
+    invalidateViolationCooldownCache();
+  }
+}
+
+/** Recent camera violation for the same student (or unknown) + type within cooldown window. */
 async function findRecentCameraViolation(studentId, violationType, { status } = {}) {
   const vt = String(violationType).toLowerCase().trim();
-  const windowStart = new Date(Date.now() - VIOLATION_COOLDOWN_MS).toISOString();
+  const cooldownMs = await getViolationCooldownMs();
+  const windowStart = new Date(Date.now() - cooldownMs).toISOString();
   let query = supabase
     .from("violations")
     .select("id, created_at")
@@ -381,8 +448,9 @@ async function createLiveCameraViolationIfEligible({
     );
 
     if (recent) {
+      const cooldownMs = await getViolationCooldownMs();
       const cooldownUntil = new Date(
-        new Date(recent.created_at).getTime() + VIOLATION_COOLDOWN_MS,
+        new Date(recent.created_at).getTime() + cooldownMs,
       ).toISOString();
       console.log(
         `[Violation] Cooldown active for ${studentName || "Unknown"} (${vt}) — detection only`,
@@ -532,9 +600,10 @@ async function applyFineIfEligible(
       `[Fine] Rule "${rule.title}" (vt="${rule.violation_type || "catch-all"}") matched AI type "${violationType}"`,
     );
 
-    // Check 15-minute cooldown: same student + same violation type
+    // Cooldown: same student + same violation type within configured window
     if (!skipCooldown) {
-      const windowStart = new Date(Date.now() - VIOLATION_COOLDOWN_MS).toISOString();
+      const cooldownMs = await getViolationCooldownMs();
+      const windowStart = new Date(Date.now() - cooldownMs).toISOString();
       const { data: recentFine } = await supabase
         .from("fines")
         .select("id, created_at")
@@ -551,7 +620,7 @@ async function applyFineIfEligible(
           applied: false,
           reason: "cooldown_active",
           cooldownUntil: new Date(
-            new Date(recentFine.created_at).getTime() + VIOLATION_COOLDOWN_MS,
+            new Date(recentFine.created_at).getTime() + cooldownMs,
           ).toISOString(),
         };
       }
@@ -2064,6 +2133,61 @@ app.delete("/api/policy-rules/:id", authenticate, async (req, res) => {
       .eq("id", req.params.id);
     if (error) throw error;
     res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* -------------------- System settings -------------------- */
+app.get("/api/system-settings", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    const violationCooldownMinutes = await getViolationCooldownMinutes();
+    res.json({ violationCooldownMinutes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/system-settings", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const minutes = clampCooldownMinutes(req.body.violationCooldownMinutes);
+    const { error } = await supabase.from("system_settings").upsert(
+      {
+        key: SETTING_KEY_VIOLATION_COOLDOWN,
+        value: String(minutes),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "key" },
+    );
+    if (error) throw error;
+
+    invalidateViolationCooldownCache();
+
+    await supabase.from("activity_logs").insert({
+      action: "Violation cooldown updated",
+      description: `Admin set violation/fine cooldown to ${minutes} minute(s)`,
+      user_name: req.user.name || "Admin",
+      icon: "Settings",
+      color: "blue",
+    });
+
+    res.json({ violationCooldownMinutes: minutes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/internal/violation-cooldown", internalAuth, async (req, res) => {
+  try {
+    const minutes = await getViolationCooldownMinutes();
+    res.json({ minutes, seconds: minutes * 60 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -4062,6 +4186,11 @@ server.on("error", (err) => {
 
 // Ensure Supabase Storage bucket exists for violation clips
 (async () => {
+  try {
+    await ensureSystemSettings();
+  } catch (e) {
+    console.warn("[Settings] Init error:", e.message);
+  }
   try {
     const { data: buckets, error: listErr } =
       await supabase.storage.listBuckets();

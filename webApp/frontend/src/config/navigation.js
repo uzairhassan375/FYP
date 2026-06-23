@@ -13,6 +13,7 @@ import {
     Award,
     Flag,
     MessageSquare,
+    Settings,
 } from "lucide-react";
 
 export const adminSidebarItems = [
@@ -24,6 +25,7 @@ export const adminSidebarItems = [
     { label: "Users", path: "/users", icon: UserCog },
     { label: "Cameras", path: "/cameras", icon: Camera },
     { label: "Policy Rules", path: "/policy-rules", icon: FileText },
+    { label: "System Settings", path: "/system-settings", icon: Settings },
     { label: "Notifications", path: "/notifications", icon: Bell },
     { label: "History Logs", path: "/history-logs", icon: History },
 ];
