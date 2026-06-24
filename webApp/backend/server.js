@@ -680,6 +680,9 @@ app.use(express.urlencoded({ limit: "10mb", extended: true }));
 const PROCESS_ID = Math.random().toString(36).substring(7).toUpperCase();
 const AI_SERVER_URL = process.env.AI_SERVER_URL || "http://127.0.0.1:8000";
 const AI_STATIC_DIR = path.resolve(__dirname, "..", "ai", "static");
+const AI_UPLOADS_DIR = path.resolve(__dirname, "..", "ai", "uploads");
+const AI_ENROLL_UPLOADS_DIR = path.resolve(__dirname, "..", "ai", "enroll_uploads");
+const CLIP_FRAMES_DIR = path.join(__dirname, "frames", "clips");
 const LIVE_RECOGNITION_TIMEOUT_MS = 30000;
 console.log(`[System] Initializing HawkEye Server (Process ID: ${PROCESS_ID})`);
 const hasSupabase = !!(
@@ -2188,6 +2191,463 @@ app.get("/api/internal/violation-cooldown", internalAuth, async (req, res) => {
   try {
     const minutes = await getViolationCooldownMinutes();
     res.json({ minutes, seconds: minutes * 60 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* -------------------- Admin storage cleanup -------------------- */
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function safeDeleteFile(filePath, allowedDir) {
+  const resolved = path.resolve(filePath);
+  const allowed = path.resolve(allowedDir);
+  if (!resolved.startsWith(allowed + path.sep) && resolved !== allowed) {
+    throw new Error(`Refusing to delete outside allowed directory: ${filePath}`);
+  }
+  if (!fs.existsSync(resolved)) return false;
+  fs.unlinkSync(resolved);
+  return true;
+}
+
+function listLocalFiles(dir, { namePattern = null, referencedNames = null } = {}) {
+  if (!fs.existsSync(dir)) {
+    return { files: [], totalSize: 0, orphanCount: 0 };
+  }
+  const files = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (namePattern && !namePattern.test(name)) continue;
+    const fullPath = path.join(dir, name);
+    let stat;
+    try {
+      stat = fs.statSync(fullPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    const referenced = referencedNames ? referencedNames.has(name) : false;
+    const orphan = referencedNames ? !referenced : true;
+    files.push({
+      name,
+      path: fullPath,
+      size: stat.size,
+      sizeLabel: formatBytes(stat.size),
+      modifiedAt: stat.mtime.toISOString(),
+      orphan,
+    });
+  }
+  files.sort((a, b) => new Date(b.modifiedAt) - new Date(a.modifiedAt));
+  const orphanFiles = files.filter((f) => f.orphan);
+  const totalSize = orphanFiles.reduce((sum, f) => sum + f.size, 0);
+  return { files, orphanFiles, totalSize, orphanCount: orphanFiles.length };
+}
+
+function listLocalDirs(dir) {
+  if (!fs.existsSync(dir)) {
+    return { files: [], totalSize: 0, orphanCount: 0 };
+  }
+  const files = [];
+  for (const name of fs.readdirSync(dir)) {
+    const fullPath = path.join(dir, name);
+    let stat;
+    try {
+      stat = fs.statSync(fullPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    let dirSize = 0;
+    try {
+      for (const entry of fs.readdirSync(fullPath)) {
+        const entryPath = path.join(fullPath, entry);
+        const entryStat = fs.statSync(entryPath);
+        if (entryStat.isFile()) dirSize += entryStat.size;
+      }
+    } catch {
+      /* ignore */
+    }
+    files.push({
+      name,
+      path: fullPath,
+      size: dirSize,
+      sizeLabel: formatBytes(dirSize),
+      modifiedAt: stat.mtime.toISOString(),
+      orphan: true,
+    });
+  }
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  return { files, orphanFiles: files, totalSize, orphanCount: files.length };
+}
+
+async function listSupabaseBucketObjects(bucket, prefix = "") {
+  const out = [];
+  const { data, error } = await supabase.storage.from(bucket).list(prefix, {
+    limit: 1000,
+    sortBy: { column: "updated_at", order: "desc" },
+  });
+  if (error) throw error;
+  for (const item of data || []) {
+    const itemPath = prefix ? `${prefix}/${item.name}` : item.name;
+    if (!item.id) {
+      const nested = await listSupabaseBucketObjects(bucket, itemPath);
+      out.push(...nested);
+      continue;
+    }
+    out.push({
+      name: item.name,
+      path: itemPath,
+      size: item.metadata?.size || 0,
+      sizeLabel: formatBytes(item.metadata?.size || 0),
+      modifiedAt: item.updated_at || item.created_at || null,
+    });
+  }
+  return out;
+}
+
+function clipUrlToStoragePath(clipUrl) {
+  if (!clipUrl) return null;
+  const match = String(clipUrl).match(/violation-clips\/([^?]+)/i);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+async function buildStorageCleanupReport() {
+  const { data: violationRows } = await supabase
+    .from("violations")
+    .select("clip_url");
+  const referencedClipPaths = new Set(
+    (violationRows || [])
+      .map((row) => clipUrlToStoragePath(row.clip_url))
+      .filter(Boolean),
+  );
+
+  const { data: manualRows } = await supabase
+    .from("manual_violations")
+    .select("video_storage_path, image_storage_path");
+  const referencedManualPaths = new Set();
+  for (const row of manualRows || []) {
+    if (row.video_storage_path) referencedManualPaths.add(row.video_storage_path);
+    if (row.image_storage_path) referencedManualPaths.add(row.image_storage_path);
+  }
+
+  const { data: studentRows } = await supabase.from("students").select("video_path");
+  const referencedStudentVideos = new Set(
+    (studentRows || [])
+      .map((row) => (row.video_path ? path.basename(row.video_path) : null))
+      .filter(Boolean),
+  );
+
+  const aiUploads = listLocalFiles(AI_UPLOADS_DIR);
+  const aiProcessed = listLocalFiles(AI_STATIC_DIR, {
+    namePattern: /^processed_.+\.(mp4|webm|avi)$/i,
+  });
+  const aiTemp = listLocalFiles(AI_STATIC_DIR, {
+    namePattern: /\.temp\.(mp4|webm)$/i,
+  });
+  const aiEnrollTemp = listLocalFiles(AI_ENROLL_UPLOADS_DIR);
+  const backendUploads = listLocalFiles(path.join(__dirname, "uploads"), {
+    referencedNames: referencedStudentVideos,
+  });
+  const clipFrameCache = listLocalDirs(CLIP_FRAMES_DIR);
+
+  let violationClipObjects = [];
+  let manualEvidenceObjects = [];
+  try {
+    violationClipObjects = await listSupabaseBucketObjects("violation-clips");
+  } catch (err) {
+    console.warn("[Storage cleanup] violation-clips list failed:", err.message);
+  }
+  try {
+    manualEvidenceObjects = await listSupabaseBucketObjects("manual-violations");
+  } catch (err) {
+    console.warn("[Storage cleanup] manual-violations list failed:", err.message);
+  }
+
+  const violationClipsOrphan = violationClipObjects
+    .map((obj) => ({
+      ...obj,
+      orphan: !referencedClipPaths.has(obj.path),
+    }))
+    .filter((obj) => obj.orphan);
+  const manualEvidenceOrphan = manualEvidenceObjects
+    .map((obj) => ({
+      ...obj,
+      orphan: !referencedManualPaths.has(obj.path),
+    }))
+    .filter((obj) => obj.orphan);
+
+  const categories = [
+    {
+      id: "ai_uploads",
+      label: "AI offline uploads",
+      description:
+        "Source videos saved during offline analysis (not stored in the database).",
+      location: AI_UPLOADS_DIR,
+      storage: "local",
+      ...summarizeCategory(aiUploads.files, aiUploads.files),
+    },
+    {
+      id: "ai_processed",
+      label: "AI processed videos",
+      description:
+        "Annotated output MP4s from offline analysis. Safe to remove after review.",
+      location: AI_STATIC_DIR,
+      storage: "local",
+      ...summarizeCategory(aiProcessed.files, aiProcessed.orphanFiles),
+    },
+    {
+      id: "ai_temp",
+      label: "AI temp / incomplete files",
+      description: "Incomplete ffmpeg outputs and enrollment upload temps.",
+      location: `${AI_STATIC_DIR}, ${AI_ENROLL_UPLOADS_DIR}`,
+      storage: "local",
+      ...summarizeCategory(
+        [...aiTemp.files, ...aiEnrollTemp.files],
+        [...aiTemp.orphanFiles, ...aiEnrollTemp.orphanFiles],
+      ),
+    },
+    {
+      id: "backend_uploads",
+      label: "Orphan backend uploads",
+      description:
+        "Registration relay files no longer linked to any student record.",
+      location: path.join(__dirname, "uploads"),
+      storage: "local",
+      ...summarizeCategory(backendUploads.files, backendUploads.orphanFiles),
+    },
+    {
+      id: "clip_frame_cache",
+      label: "Violation clip frame cache",
+      description: "Temporary frame folders used while building violation clips.",
+      location: CLIP_FRAMES_DIR,
+      storage: "local",
+      ...summarizeCategory(clipFrameCache.files, clipFrameCache.orphanFiles),
+    },
+    {
+      id: "violation_clips_orphan",
+      label: "Orphan violation clips (Supabase)",
+      description:
+        "Files in violation-clips bucket with no matching violations.clip_url.",
+      location: "Supabase bucket: violation-clips",
+      storage: "supabase",
+      ...summarizeCategory(violationClipObjects, violationClipsOrphan),
+    },
+    {
+      id: "manual_evidence_orphan",
+      label: "Orphan manual evidence (Supabase)",
+      description:
+        "Files in manual-violations bucket not referenced by any manual violation report.",
+      location: "Supabase bucket: manual-violations",
+      storage: "supabase",
+      ...summarizeCategory(manualEvidenceObjects, manualEvidenceOrphan),
+    },
+  ];
+
+  const summary = categories.reduce(
+    (acc, cat) => {
+      acc.totalFiles += cat.fileCount;
+      acc.orphanFiles += cat.orphanCount;
+      acc.orphanSize += cat.orphanSize;
+      return acc;
+    },
+    { totalFiles: 0, orphanFiles: 0, orphanSize: 0 },
+  );
+  summary.orphanSizeLabel = formatBytes(summary.orphanSize);
+
+  return { categories, summary, scannedAt: new Date().toISOString() };
+}
+
+function summarizeCategory(allFiles, orphanFiles) {
+  const orphans = orphanFiles || [];
+  const orphanSize = orphans.reduce((sum, f) => sum + (f.size || 0), 0);
+  return {
+    fileCount: (allFiles || []).length,
+    orphanCount: orphans.length,
+    orphanSize,
+    orphanSizeLabel: formatBytes(orphanSize),
+    files: orphans.slice(0, 200).map((f) => ({
+      name: f.name,
+      path: f.path,
+      size: f.size,
+      sizeLabel: f.sizeLabel || formatBytes(f.size || 0),
+      modifiedAt: f.modifiedAt,
+    })),
+    truncated: orphans.length > 200,
+  };
+}
+
+async function deleteStorageCleanupCategories(categoryIds, userName) {
+  const report = await buildStorageCleanupReport();
+  const selected = new Set(categoryIds || []);
+  const results = [];
+
+  const deleteLocal = (catId, dir, files, { namePattern = null } = {}) => {
+    let deleted = 0;
+    let freed = 0;
+    for (const file of files) {
+      if (namePattern && !namePattern.test(file.name)) continue;
+      try {
+        if (safeDeleteFile(file.path, dir)) {
+          deleted += 1;
+          freed += file.size || 0;
+        }
+      } catch (err) {
+        console.warn(`[Storage cleanup] Failed to delete ${file.path}:`, err.message);
+      }
+    }
+    results.push({ category: catId, deleted, freed, freedLabel: formatBytes(freed) });
+  };
+
+  const deleteLocalDirs = (catId, baseDir, dirs) => {
+    let deleted = 0;
+    let freed = 0;
+    for (const dir of dirs) {
+      try {
+        const resolved = path.resolve(dir.path);
+        const allowed = path.resolve(baseDir);
+        if (!resolved.startsWith(allowed + path.sep)) continue;
+        for (const entry of fs.readdirSync(resolved)) {
+          const entryPath = path.join(resolved, entry);
+          const stat = fs.statSync(entryPath);
+          if (stat.isFile()) freed += stat.size;
+        }
+        fs.rmSync(resolved, { recursive: true, force: true });
+        deleted += 1;
+      } catch (err) {
+        console.warn(`[Storage cleanup] Failed to remove dir ${dir.path}:`, err.message);
+      }
+    }
+    results.push({ category: catId, deleted, freed, freedLabel: formatBytes(freed) });
+  };
+
+  if (selected.has("ai_uploads")) {
+    const cat = report.categories.find((c) => c.id === "ai_uploads");
+    deleteLocal("ai_uploads", AI_UPLOADS_DIR, cat?.files || []);
+  }
+  if (selected.has("ai_processed")) {
+    const cat = report.categories.find((c) => c.id === "ai_processed");
+    deleteLocal("ai_processed", AI_STATIC_DIR, cat?.files || [], {
+      namePattern: /^processed_.+\.(mp4|webm|avi)$/i,
+    });
+  }
+  if (selected.has("ai_temp")) {
+    const aiTemp = listLocalFiles(AI_STATIC_DIR, { namePattern: /\.temp\.(mp4|webm)$/i });
+    const aiEnroll = listLocalFiles(AI_ENROLL_UPLOADS_DIR);
+    deleteLocal("ai_temp", AI_STATIC_DIR, aiTemp.orphanFiles, {
+      namePattern: /\.temp\.(mp4|webm)$/i,
+    });
+    deleteLocal("ai_temp", AI_ENROLL_UPLOADS_DIR, aiEnroll.orphanFiles);
+  }
+  if (selected.has("backend_uploads")) {
+    const cat = report.categories.find((c) => c.id === "backend_uploads");
+    deleteLocal("backend_uploads", path.join(__dirname, "uploads"), cat?.files || []);
+  }
+  if (selected.has("clip_frame_cache")) {
+    const cat = report.categories.find((c) => c.id === "clip_frame_cache");
+    deleteLocalDirs("clip_frame_cache", CLIP_FRAMES_DIR, cat?.files || []);
+  }
+  if (selected.has("violation_clips_orphan")) {
+    const cat = report.categories.find((c) => c.id === "violation_clips_orphan");
+    const paths = (cat?.files || []).map((f) => f.path).filter(Boolean);
+    if (paths.length) {
+      const { error } = await supabase.storage.from("violation-clips").remove(paths);
+      if (error) throw error;
+      const freed = (cat?.files || []).reduce((sum, f) => sum + (f.size || 0), 0);
+      results.push({
+        category: "violation_clips_orphan",
+        deleted: paths.length,
+        freed,
+        freedLabel: formatBytes(freed),
+      });
+    } else {
+      results.push({ category: "violation_clips_orphan", deleted: 0, freed: 0, freedLabel: "0 B" });
+    }
+  }
+  if (selected.has("manual_evidence_orphan")) {
+    const cat = report.categories.find((c) => c.id === "manual_evidence_orphan");
+    const paths = (cat?.files || []).map((f) => f.path).filter(Boolean);
+    if (paths.length) {
+      const batchSize = 100;
+      let deleted = 0;
+      let freed = 0;
+      for (let i = 0; i < paths.length; i += batchSize) {
+        const batch = paths.slice(i, i + batchSize);
+        const { error } = await supabase.storage.from("manual-violations").remove(batch);
+        if (error) throw error;
+        deleted += batch.length;
+      }
+      freed = (cat?.files || []).reduce((sum, f) => sum + (f.size || 0), 0);
+      results.push({
+        category: "manual_evidence_orphan",
+        deleted,
+        freed,
+        freedLabel: formatBytes(freed),
+      });
+    } else {
+      results.push({ category: "manual_evidence_orphan", deleted: 0, freed: 0, freedLabel: "0 B" });
+    }
+  }
+
+  const totalDeleted = results.reduce((sum, r) => sum + (r.deleted || 0), 0);
+  const totalFreed = results.reduce((sum, r) => sum + (r.freed || 0), 0);
+
+  if (totalDeleted > 0) {
+    await supabase.from("activity_logs").insert({
+      action: "Storage cleanup",
+      description: `Admin deleted ${totalDeleted} file(s), freed ${formatBytes(totalFreed)} (${(categoryIds || []).join(", ")})`,
+      user_name: userName || "Admin",
+      icon: "Trash2",
+      color: "amber",
+    });
+  }
+
+  return { results, totalDeleted, totalFreed, totalFreedLabel: formatBytes(totalFreed) };
+}
+
+app.get("/api/admin/storage-cleanup", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    const report = await buildStorageCleanupReport();
+    res.json(report);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/storage-cleanup/delete", authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    const categories = Array.isArray(req.body?.categories) ? req.body.categories : [];
+    if (!categories.length) {
+      return res.status(400).json({ error: "Select at least one category to delete" });
+    }
+    const allowed = new Set([
+      "ai_uploads",
+      "ai_processed",
+      "ai_temp",
+      "backend_uploads",
+      "clip_frame_cache",
+      "violation_clips_orphan",
+      "manual_evidence_orphan",
+    ]);
+    const invalid = categories.filter((id) => !allowed.has(id));
+    if (invalid.length) {
+      return res.status(400).json({ error: `Invalid categories: ${invalid.join(", ")}` });
+    }
+    const result = await deleteStorageCleanupCategories(
+      categories,
+      req.user.name || "Admin",
+    );
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
